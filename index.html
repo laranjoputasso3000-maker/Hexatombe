@@ -19,6 +19,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;600&family=Metal+Mania&family=Oswald:wght@500;700&family=Rubik+Glitch&display=swap" rel="stylesheet">
 <link rel="preconnect" href="https://fonts.bunny.net" crossorigin>
 <link href="https://fonts.bunny.net/css?family=bebas-neue:400|inter:400,600|metal-mania:400|oswald:500,700|rubik-glitch:400&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.57.4/dist/umd/supabase.js"></script>
 <style>/* Fontes reserva (3ª fonte: jsDelivr). Usadas só se Google Fonts e Bunny Fonts falharem. */
 @font-face{font-family:'HX Metal Mania';font-style:normal;font-weight:400;font-display:swap;src:url(https://cdn.jsdelivr.net/fontsource/fonts/metal-mania@latest/latin-400-normal.woff2) format('woff2')}@font-face{font-family:'HX Bebas Neue';font-style:normal;font-weight:400;font-display:swap;src:url(https://cdn.jsdelivr.net/fontsource/fonts/bebas-neue@latest/latin-400-normal.woff2) format('woff2')}@font-face{font-family:'HX Rubik Glitch';font-style:normal;font-weight:400;font-display:swap;src:url(https://cdn.jsdelivr.net/fontsource/fonts/rubik-glitch@latest/latin-400-normal.woff2) format('woff2')}@font-face{font-family:'HX Oswald';font-style:normal;font-weight:500;font-display:swap;src:url(https://cdn.jsdelivr.net/fontsource/fonts/oswald@latest/latin-500-normal.woff2) format('woff2')}@font-face{font-family:'HX Oswald';font-style:normal;font-weight:700;font-display:swap;src:url(https://cdn.jsdelivr.net/fontsource/fonts/oswald@latest/latin-700-normal.woff2) format('woff2')}@font-face{font-family:'HX Inter';font-style:normal;font-weight:400;font-display:swap;src:url(https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-400-normal.woff2) format('woff2')}@font-face{font-family:'HX Inter';font-style:normal;font-weight:600;font-display:swap;src:url(https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-600-normal.woff2) format('woff2')}
 /* v15 */
@@ -1413,13 +1414,83 @@ function load(p){
 }
 const getState = p => STATES[p.id] || (STATES[p.id] = load(p));
 const bc = 'BroadcastChannel' in window ? new BroadcastChannel('hexatombe') : null;
-let DOC = null, dbFirst = true; const dbT = {};
-const dbSet = f => { if(DOC) DOC.update(f).catch(()=>{}); };
+/* ====================================================================
+   SUPABASE · banco compartilhado entre aparelhos (substitui o antigo claude.use('db'))
+   localStorage continua como cache local; o banco é a fonte de verdade.
+   Tabelas: ver hexatombe_sync.sql. Regra: vence o registro com maior ts.
+   ==================================================================== */
+const SB_URL = 'https://vtkmryboutjnqdorhqyl.supabase.co', SB_KEY = 'sb_publishable_SDK0czzxIYz8f4nClJ9DrA__qqK9SBT', MESA = 'live';
+let SB = null, dbFirst = true; const dbT = {};
+try{ if(window.supabase && window.supabase.createClient) SB = window.supabase.createClient(SB_URL, SB_KEY, {auth:{persistSession:false,autoRefreshToken:false,detectSessionInUrl:false}}); }catch(e){ SB = null; }
+const sbWarn = (w,e)=>{ try{ console.warn('[hexatombe/db] '+w+':', (e && e.message) || e); }catch(_){} };
+const sbRun = async (w,p)=>{ try{ const r = await p; if(r && r.error) throw r.error; return r || {}; }catch(e){ sbWarn(w,e); return null; } };
+const SB_Q = {};   // gravações pendentes (reenviadas se a rede falhar)
+function sbSend(key,fn){
+  if(!SB) return; SB_Q[key] = fn;
+  (async function go(n){ const f = SB_Q[key]; if(!f) return;
+    const r = await sbRun(key,f());
+    if(r){ if(SB_Q[key]===f) delete SB_Q[key]; }
+    else if(n<30) setTimeout(()=>{ if(SB_Q[key]===f) go(n+1); }, Math.min(30000,2000*(n+1)));
+  })(0);
+}
+const sj = v => JSON.stringify(v,(k,x)=> x && typeof x==='object' && !Array.isArray(x) ? Object.keys(x).sort().reduce((o,q)=>(o[q]=x[q],o),{}) : x);   // JSON estável (jsonb reordena chaves)
+const num = v => Number(v)||0;
+
+/* --- ficha --- */
+const stToRow = (id,s)=>{ const {atributos,status,mascara,inventario,condicoes,condicaoAtual,aliados,ts,...extra} = s, {pvAtual,pvMax,detAtual,detMax,...stx} = status||{};
+  return {personagem_id:id, pv_atual:pvAtual|0, pv_max:pvMax|0, det_atual:detAtual|0, det_max:detMax|0, atributos:atributos||{}, mascara:!!mascara, inventario:inventario||[], condicoes:condicoes||[], condicao_atual:condicaoAtual||'Estável', aliados:aliados||[], extra:{...extra,_status:stx}, ts:ts||0}; };
+const rowToSt = r => { const {_status,...ex} = r.extra||{};
+  return {...ex, atributos:r.atributos||{}, status:{pvAtual:r.pv_atual,pvMax:r.pv_max,detAtual:r.det_atual,detMax:r.det_max,...(_status||{})}, mascara:!!r.mascara, inventario:r.inventario||[], condicoes:r.condicoes||[], condicaoAtual:r.condicao_atual, aliados:r.aliados||[], ts:num(r.ts)}; };
+const sbState = (id,s)=>{ clearTimeout(dbT[id]); dbT[id] = setTimeout(()=>sbSend('st:'+id+':'+s.ts,()=>SB.from('ficha_estado').upsert(stToRow(id,s))),300); };
+
+/* --- singletons: trilha, sessão, áudio preparado --- */
+const rowMusic = r => ({...M, track:r.faixa, playing:!!r.tocando, loop:!!r.loop, vol:Number(r.volume), index:r.indice|0, ts:num(r.ts)});
+const rowSes = r => ({...SES, lock:!!r.lock, base:!!r.base, turn:r.turno ?? null, ts:num(r.ts)});
+const rowPrep = r => ({ids:r.ids||[], ts:num(r.ts)});
+
+/* --- listas (combates, ameaças, itens): 1 linha por registro --- */
+const LISTS = {
+  cmb:     { table:'combates', row:(c,ts)=>({id:c.id,mesa_id:MESA,num:c.num??null,nome:c.nome??null,estado:c.estado??null,dados:c,excluida:false,ts}),
+             local:()=>CMB, apply:o=>onRemoteCmb({...o,seq:Math.max(CMB.seq||0,...o.list.map(c=>c.num||0))}) },
+  ameacas: { table:'ameacas', row:(c,ts)=>({id:c.id,mesa_id:MESA,nome:c.nome??null,dados:c,excluida:false,ts}),
+             local:()=>({list:AM_CUST,ts:AM_TS}), apply:o=>onRemoteAm(o) },
+  itens:   { table:'itens', row:(c,ts)=>({id:c.id,mesa_id:MESA,nome:c.nome??null,dados:c,excluida:false,ts}),
+             local:()=>({list:ITENS_CUST,ts:IT_TS}), apply:o=>onRemoteItens(o) }
+};
+const LSENT = {cmb:new Map(),ameacas:new Map(),itens:new Map()}, LPULL = {};
+function publishList(kind,obj){
+  const L = LISTS[kind], sent = LSENT[kind], ts = obj.ts||Date.now(), rows = [], cur = new Set();
+  (obj.list||[]).forEach(c=>{ if(!c||!c.id) return; cur.add(c.id); const j = sj(c); if(sent.get(c.id)!==j){ rows.push(L.row(c,ts)); sent.set(c.id,j); } });
+  [...sent.keys()].forEach(id=>{ if(!cur.has(id)){ rows.push({...L.row({id,nome:null},ts),dados:{},excluida:true}); sent.delete(id); } });   // removido localmente => marca como excluído
+  if(rows.length) sbSend('L:'+kind+':'+ts+':'+Math.random().toString(36).slice(2,6),()=>SB.from(L.table).upsert(rows));
+}
+async function pullList(kind){
+  const L = LISTS[kind], r = await sbRun('pull '+kind,SB.from(L.table).select('*').eq('mesa_id',MESA).order('criado_em',{ascending:true}).order('id',{ascending:true}));
+  if(!r || !r.data) return;
+  const live = r.data.filter(x=>!x.excluida), rts = r.data.reduce((m,x)=>Math.max(m,num(x.ts)),0), loc = L.local(), sent = LSENT[kind];
+  sent.clear(); live.forEach(x=>sent.set(x.id,sj(x.dados)));
+  if((loc.ts||0) > rts){ publishList(kind,loc); return; }       // este aparelho tem dado mais novo (ex.: criado offline) => envia
+  if(rts <= (loc.ts||0)) return;
+  const o = {list:live.map(x=>x.dados),ts:rts}; try{ localStorage.setItem('hexatombe:'+kind,JSON.stringify(kind==='cmb'?{...o,seq:Math.max(CMB.seq||0,...o.list.map(c=>c.num||0))}:o)); }catch(e){}
+  L.apply(o);
+}
+const pullSoon = k=>{ clearTimeout(LPULL[k]); LPULL[k] = setTimeout(()=>pullList(k),150); };
+
+/* --- publicar (substitui o antigo dbSet) --- */
+function dbPublish(kind,obj){
+  if(!SB || !obj) return;
+  if(kind==='music') sbSend('music:'+obj.ts,()=>SB.from('trilha_sonora').upsert({mesa_id:MESA,faixa:obj.track,tocando:!!obj.playing,loop:!!obj.loop,volume:Math.max(0,Math.min(1,+obj.vol||0)),indice:obj.index|0,ts:obj.ts||0}));
+  else if(kind==='ses') sbSend('ses:'+obj.ts,()=>SB.from('sessao').upsert({mesa_id:MESA,lock:!!obj.lock,base:!!obj.base,turno:obj.turn??null,ts:obj.ts||0}));
+  else if(kind==='prep') sbSend('prep:'+obj.ts,()=>SB.from('audio_preparado').upsert({mesa_id:MESA,ids:obj.ids||[],ts:obj.ts||0}));
+  else if(kind==='fx') sbRun('fx',SB.from('eventos').insert({mesa_id:MESA,tipo:'fx',ref_id:obj.id,ligado:!!obj.on,dados:obj.d??null,ts:obj.ts}));
+  else if(kind==='sfx') sbRun('sfx',SB.from('eventos').insert({mesa_id:MESA,tipo:'sfx',ref_id:obj.id,ts:obj.ts}));
+  else if(LISTS[kind]) publishList(kind,obj);
+}
 function persist(p){
   const s = getState(p); s.ts = Date.now();
   try{ localStorage.setItem(KEY(p.id),JSON.stringify(s)); }catch(e){}
   bc?.postMessage({t:'state',id:p.id,s});
-  clearTimeout(dbT[p.id]); dbT[p.id] = setTimeout(()=>dbSet({['c_'+p.id]:JSON.stringify(s)}),300);
+  sbState(p.id,s);
 }
 function onRemoteState(id,s){
   const p = byId(id); if(!p||!s) return; const l = getState(p); if((l.ts||0) >= (s.ts||0)) return;
@@ -1434,7 +1505,7 @@ function onRemoteState(id,s){
 }
 function publish(kind,obj){
   try{ localStorage.setItem('hexatombe:'+kind,JSON.stringify(obj)); }catch(e){}
-  bc?.postMessage({t:kind,o:obj}); dbSet({[kind]:JSON.stringify(obj)});
+  bc?.postMessage({t:kind,o:obj}); dbPublish(kind,obj);
 }
 if(bc) bc.onmessage = e=>{ const m = e.data||{}; if(m.t==='state') onRemoteState(m.id,m.s); else if(m.t==='music') onRemoteMusic(m.o); else if(m.t==='fx') onRemoteFx(m.o); else if(m.t==='ses') onRemoteSes(m.o); else if(m.t==='sfx') onRemoteSfx(m.o); else if(m.t==='cmb') onRemoteCmb(m.o); else if(m.t==='ameacas') onRemoteAm(m.o); else if(m.t==='itens') onRemoteItens(m.o); else if(m.t==='prep') onRemotePrep(m.o); };
 window.addEventListener('storage',e=>{
@@ -1443,27 +1514,36 @@ window.addEventListener('storage',e=>{
     if(e.key.startsWith('hexatombe:v1:')) onRemoteState(e.key.slice(13),v);
     else if(e.key==='hexatombe:music') onRemoteMusic(v); else if(e.key==='hexatombe:fx') onRemoteFx(v); else if(e.key==='hexatombe:ses') onRemoteSes(v); else if(e.key==='hexatombe:sfx') onRemoteSfx(v); else if(e.key==='hexatombe:cmb') onRemoteCmb(v); else if(e.key==='hexatombe:ameacas') onRemoteAm(v); else if(e.key==='hexatombe:itens') onRemoteItens(v); else if(e.key==='hexatombe:prep') onRemotePrep(v); }catch(_){}
 });
-function initDb(){   // sincronização entre aparelhos (quando o recurso de banco compartilhado estiver disponível)
-  if(!window.claude || !claude.use) return;
-  claude.use('db').then(async db=>{
-    if(!db) return;
-    try{
-      DOC = db.doc('hexatombe/live'); const s0 = await DOC.get(); if(!s0.exists) await DOC.set({init:Date.now()});
-      DOC.onSnapshot(snap=>{
-        const d = snap.data() || {};
-        TEMPLATE_DATA.personagens.forEach(p=>{ if(d['c_'+p.id]) try{ onRemoteState(p.id,JSON.parse(d['c_'+p.id])); }catch(e){} });
-        if(d.music) try{ onRemoteMusic(JSON.parse(d.music)); }catch(e){}
-        if(d.fx) try{ const f = JSON.parse(d.fx); if(!dbFirst || Date.now()-f.ts < 6000) onRemoteFx(f); }catch(e){}
-        if(d.ses) try{ onRemoteSes(JSON.parse(d.ses)); }catch(e){}
-        if(d.sfx) try{ onRemoteSfx(JSON.parse(d.sfx)); }catch(e){}
-        if(d.ameacas) try{ onRemoteAm(JSON.parse(d.ameacas)); }catch(e){}
-        if(d.itens) try{ onRemoteItens(JSON.parse(d.itens)); }catch(e){}
-        if(d.prep) try{ onRemotePrep(JSON.parse(d.prep)); }catch(e){}
-        if(d.cmb) try{ onRemoteCmb(JSON.parse(d.cmb)); }catch(e){}
-        dbFirst = false;
-      },()=>{});
-    }catch(e){ DOC = null; }
-  }).catch(()=>{});
+function initDb(){   // sincronização entre aparelhos via Supabase (Realtime + leitura inicial)
+  if(!SB){ sbWarn('supabase-js não carregou','sincronização desativada; usando só o armazenamento local'); return; }
+  const ch = SB.channel('hexatombe-'+MESA), on = (table,fn,event)=> ch.on('postgres_changes',{event:event||'*',schema:'public',table},fn);
+  on('ficha_estado',p=>{ const r = p.new; if(r && r.personagem_id) onRemoteState(r.personagem_id,rowToSt(r)); });
+  on('trilha_sonora',p=>{ if(p.new) onRemoteMusic(rowMusic(p.new)); });
+  on('sessao',p=>{ if(p.new) onRemoteSes(rowSes(p.new)); });
+  on('audio_preparado',p=>{ if(p.new) onRemotePrep(rowPrep(p.new)); });
+  on('eventos',p=>{ const r = p.new; if(!r) return; if(r.tipo==='fx') onRemoteFx({id:r.ref_id,on:!!r.ligado,ts:num(r.ts),d:r.dados??undefined}); else if(r.tipo==='sfx') onRemoteSfx({id:r.ref_id,ts:num(r.ts)}); },'INSERT');
+  Object.keys(LISTS).forEach(k=>on(LISTS[k].table,()=>pullSoon(k)));
+  ch.subscribe(s=>{ if(s==='SUBSCRIBED') syncAll(); });
+  document.addEventListener('visibilitychange',()=>{ if(!document.hidden){ syncAll(); try{ MemStore.resync(); }catch(e){} } });
+  window.addEventListener('online',()=>{ syncAll(); try{ MemStore.resync(); }catch(e){} });
+}
+async function syncAll(){   // leitura completa (abertura, reconexão, volta ao primeiro plano) + envia o que este aparelho tem de mais novo
+  if(!SB) return; const first = dbFirst; dbFirst = false;
+  const [fe,mu,se,pr,fx] = await Promise.all([
+    sbRun('ficha',SB.from('ficha_estado').select('*')),
+    sbRun('trilha',SB.from('trilha_sonora').select('*').eq('mesa_id',MESA).maybeSingle()),
+    sbRun('sessao',SB.from('sessao').select('*').eq('mesa_id',MESA).maybeSingle()),
+    sbRun('prep',SB.from('audio_preparado').select('*').eq('mesa_id',MESA).maybeSingle()),
+    sbRun('fx',SB.from('fx_ultimo').select('*').eq('mesa_id',MESA))
+  ]);
+  if(fe && fe.data) fe.data.forEach(r=>{ const p = byId(r.personagem_id); if(!p) return;
+    const l = getState(p); if(num(r.ts) > (l.ts||0)) onRemoteState(r.personagem_id,rowToSt(r)); else if((l.ts||0) > num(r.ts)) sbState(r.personagem_id,l); });
+  if(mu && mu.data){ const r = mu.data; if(num(r.ts) > (M.ts||0)) onRemoteMusic(rowMusic(r)); else if((M.ts||0) > num(r.ts)) dbPublish('music',M); }
+  if(se && se.data){ const r = se.data; if(num(r.ts) > (SES.ts||0)) onRemoteSes(rowSes(r)); else if((SES.ts||0) > num(r.ts)) dbPublish('ses',SES); }
+  if(pr && pr.data){ const r = pr.data; if(num(r.ts) > (PREP.ts||0)) onRemotePrep(rowPrep(r)); else if((PREP.ts||0) > num(r.ts)) dbPublish('prep',PREP); }
+  if(fx && fx.data) fx.data.forEach(r=>{ const a = ANIMACOES.find(x=>x.id===r.ref_id), persiste = r.ref_id==='velisar' || (a && a.duracao===0);
+    if(Date.now()-num(r.ts) < 6000 || persiste) onRemoteFx({id:r.ref_id,on:!!r.ligado,ts:num(r.ts),d:r.dados??undefined}); });   // efeitos com fim próprio só valem se recentes
+  Object.keys(LISTS).forEach(k=>pullList(k));
 }
 
 /* ---------- Áudio: trilha (YouTube + ambiente gerado) e soundboard ---------- */
@@ -2480,13 +2560,14 @@ const memNome = id => { const p = byId(id); return p ? dname(p) : '(removido)'; 
 /* ---------- 1 · ARMAZENAMENTO ---------- */
 const MemStore = (()=>{
   const K = { m:'hexatombe:mem:m', p:id=>'hexatombe:mem:p:'+id, v:id=>'hexatombe:mem:v:'+id, out:'hexatombe:mem:outbox' };
-  const D = { m:'hexatombe/mem_m', p:id=>'hexatombe/mem_'+id };
   const rd = (k,def)=>{ try{ const v = JSON.parse(localStorage.getItem(k)); return v ?? def; }catch(e){ return def; } };
   const wr = (k,v)=>{ try{ localStorage.setItem(k,JSON.stringify(v)); return true; }catch(e){ return false; } };
-  const hasDb = ()=> !!(window.claude && claude.use);
-  let dbp = null; const docs = {}, subs = new Set(); let flushing = false;
-  const db = ()=> hasDb() ? (dbp || (dbp = claude.use('db').catch(()=>null))) : Promise.resolve(null);
-  const doc = async path => { const d = await db(); return d ? (docs[path] || (docs[path] = d.doc(path))) : null; };
+  const hasDb = ()=> !!SB;
+  const subs = new Set(), PULLS = [], SENT = new Map();
+  const rowToMem = r => ({id:r.id,destinatario:r.destinatario,titulo:r.titulo,conteudo:r.conteudo,criadaEm:num(r.criada_em_ms),atualizadaEm:num(r.atualizada_em_ms),estado:r.estado,
+    disponibilizadaEm:r.disponibilizada_em_ms==null?null:num(r.disponibilizada_em_ms),visualizadaEm:r.visualizada_em_ms==null?null:num(r.visualizada_em_ms),...(r.excluida?{excluida:true}:{})});
+  const memToRow = m => ({id:m.id,mesa_id:MESA,destinatario:m.destinatario,titulo:m.titulo,conteudo:m.conteudo,estado:m.estado||'rascunho',excluida:!!m.excluida,
+    criada_em_ms:m.criadaEm||Date.now(),atualizada_em_ms:m.atualizadaEm||Date.now(),disponibilizada_em_ms:m.disponibilizadaEm||null,visualizada_em_ms:m.visualizadaEm||null});
   const rank = m => MEM_RANK[m.estado]||0;
   function merge(a,b){   // une duas listas por id; o estado nunca regride; exclusão de rascunho prevalece
     const map = new Map();
@@ -2501,39 +2582,45 @@ const MemStore = (()=>{
   const mergeMap = (a,b)=>{ const o = {...(a||{})}; Object.entries(b||{}).forEach(([k,v])=>{ o[k] = o[k] ? Math.min(o[k],v) : v; }); return o; };
   const vistas = id => rd(K.v(id),{map:{}}).map || {};
   const withSeen = (list,id)=>{ const v = vistas(id); return list.map(m=> v[m.id] && rank(m)<2 ? {...m,estado:'visualizada',visualizadaEm:v[m.id]} : m); };
-  /* fila de gravação (não perde dados se o banco estiver indisponível; reenvia depois) */
-  const queue = (path,fields)=>{ if(!hasDb()) return; const q = rd(K.out,[]), e = q.find(x=>x.path===path);
-    if(e) e.fields = {...e.fields,...fields}; else q.push({path,fields}); wr(K.out,q); flush(); };
-  async function flush(){
-    if(flushing) return; flushing = true;
-    try{ for(;;){ const q = rd(K.out,[]); if(!q.length) break; const e = q[0], d = await doc(e.path); if(!d) break;
-        try{ await d.update(e.fields); }catch(_){ await d.set(e.fields); }
-        const q2 = rd(K.out,[]); if(q2.length && q2[0].path===e.path && JSON.stringify(q2[0].fields)===JSON.stringify(e.fields)) q2.shift(); wr(K.out,q2); }
-    }catch(e){ setTimeout(flush,6000); }
-    flushing = false;
-  }
   const notify = id => { bc?.postMessage({t:'mem',id}); if(typeof memChanged==='function') memChanged(id); };
-  /* assinatura dos documentos do banco compartilhado */
-  const sub = (path,fn)=>{ if(subs.has(path)||!hasDb()) return; subs.add(path); doc(path).then(d=>{ if(!d){ subs.delete(path); return; } d.onSnapshot(s=>{ try{ fn(s.data()||{}); }catch(e){} },()=>{}); }).catch(()=>subs.delete(path)); };
+  /* gravação no banco (só o que mudou; reenvia sozinho se a rede falhar) */
+  function pushMaster(){
+    if(!SB) return; const rows = (rd(K.m,{list:[]}).list||[]).filter(m=>m&&m.id&&m.destinatario).filter(m=>SENT.get(m.id)!==sj(m));
+    if(!rows.length) return; rows.forEach(m=>SENT.set(m.id,sj(m)));
+    sbSend('mem:'+Date.now()+':'+Math.random().toString(36).slice(2,6),()=>SB.from('memorias').upsert(rows.map(memToRow)));
+  }
+  /* leitura/assinatura: o aparelho do jogador só lê as próprias memórias já liberadas (view memorias_jogador) */
+  const sub = (key,table,filter,pull)=>{ if(subs.has(key)||!SB) return; subs.add(key); PULLS.push(pull);
+    const cfg = {event:'*',schema:'public',table}; if(filter) cfg.filter = filter;
+    SB.channel('mem-'+key).on('postgres_changes',cfg,()=>pull()).subscribe(s=>{ if(s==='SUBSCRIBED') pull(); }); };
   const api = {
-    K, D, merge, vistas, rank,
+    K, merge, vistas, rank,
     masterRaw(){ return withSeenAll(merge(rd(K.m,{list:[]}).list,[])); },
     master(){ return api.masterRaw().filter(m=>!m.excluida); },
-    saveMaster(list){ wr(K.m,{list,ts:Date.now()}); queue(D.m,{lista:JSON.stringify(list),ts:Date.now()}); notify('m'); },
+    saveMaster(list){ wr(K.m,{list,ts:Date.now()}); pushMaster(); notify('m'); },
     playerList(id){ return withSeen(merge(rd(K.p(id),{list:[]}).list,[]),id).filter(m=>m.destinatario===id && m.estado!=='rascunho' && !m.excluida); },
-    writePlayerList(id,list){ wr(K.p(id),{list,ts:Date.now()}); queue(D.p(id),{lista:JSON.stringify(list),ts:Date.now()}); notify(id); },
-    markSeen(id,memId){ const v = rd(K.v(id),{map:{}}); v.map = v.map||{}; if(!v.map[memId]) v.map[memId] = Date.now(); wr(K.v(id),v); queue(D.p(id),{vistas:JSON.stringify(v.map)}); notify(id); },
-    subPlayer(id){ sub(D.p(id), d=>{ let ch = false;
-      if(d.lista){ const r = JSON.parse(d.lista), l = rd(K.p(id),{list:[]}); const m = merge(l.list,r); if(JSON.stringify(m)!==JSON.stringify(l.list)){ wr(K.p(id),{list:m,ts:Date.now()}); ch = true; } }
-      if(d.vistas){ const r = JSON.parse(d.vistas), l = rd(K.v(id),{map:{}}).map||{}, m = mergeMap(l,r); if(JSON.stringify(m)!==JSON.stringify(l)){ wr(K.v(id),{map:m}); ch = true; } }
+    writePlayerList(id,list){ wr(K.p(id),{list,ts:Date.now()}); notify(id); },   // a cópia do jogador vem do banco; aqui só cache local
+    markSeen(id,memId){ const v = rd(K.v(id),{map:{}}); v.map = v.map||{}; if(!v.map[memId]) v.map[memId] = Date.now(); wr(K.v(id),v);
+      if(SB) sbSend('seen:'+memId,()=>SB.rpc('hx_memoria_visualizar',{p_id:memId,p_personagem:id})); notify(id); },
+    subPlayer(id){ sub('p:'+id,'memorias','destinatario=eq.'+id, async ()=>{
+      const r = await sbRun('mem jogador',SB.from('memorias_jogador').select('*').eq('destinatario',id)); if(!r || !r.data) return;
+      const rem = r.data.map(rowToMem), l = rd(K.p(id),{list:[]}), m = merge(l.list,rem); let ch = false;
+      if(JSON.stringify(m)!==JSON.stringify(l.list)){ wr(K.p(id),{list:m,ts:Date.now()}); ch = true; }
+      const seen = {}; rem.forEach(x=>{ if(x.visualizadaEm) seen[x.id] = x.visualizadaEm; });
+      const lv = rd(K.v(id),{map:{}}).map||{}, mv = mergeMap(lv,seen); if(JSON.stringify(mv)!==JSON.stringify(lv)){ wr(K.v(id),{map:mv}); ch = true; }
+      Object.keys(lv).forEach(mid=>{ if(!seen[mid]) sbSend('seen:'+mid,()=>SB.rpc('hx_memoria_visualizar',{p_id:mid,p_personagem:id})); });   // visualização feita offline
       if(ch) notify(id); }); },
-    subMaster(){ sub(D.m, d=>{ if(!d.lista) return; const r = JSON.parse(d.lista), l = rd(K.m,{list:[]}), m = merge(l.list,r);
-      if(JSON.stringify(m)!==JSON.stringify(l.list)){ wr(K.m,{list:m,ts:Date.now()}); notify('m'); } });
-      PERS.forEach(p=>api.subPlayer(p.id)); },
-    flush
+    subMaster(){ sub('m','memorias',null, async ()=>{
+      const r = await sbRun('mem mestre',SB.from('memorias').select('*').eq('mesa_id',MESA)); if(!r || !r.data) return;
+      r.data.forEach(x=>SENT.set(x.id,sj(rowToMem(x))));
+      const l = rd(K.m,{list:[]}), m = merge(l.list,r.data.map(rowToMem));
+      if(JSON.stringify(m)!==JSON.stringify(l.list)){ wr(K.m,{list:m,ts:Date.now()}); notify('m'); }
+      pushMaster(); }); },
+    resync(){ PULLS.forEach(f=>f()); pushMaster(); },
+    flush: pushMaster
   };
   function withSeenAll(list){ const v = {}; return list.map(m=>{ const mv = v[m.destinatario] || (v[m.destinatario] = vistas(m.destinatario)); return mv[m.id] && rank(m)<2 ? {...m,estado:'visualizada',visualizadaEm:mv[m.id]} : m; }); }
-  setTimeout(flush,1500);
+  setTimeout(pushMaster,1500);
   return api;
 })();
 
